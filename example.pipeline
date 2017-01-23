@@ -1,0 +1,126 @@
+//
+// Copyright (c) 2015, Raymond Barbiero
+//
+def myci
+def stash
+def conf
+def stash_user_pw = ['','']
+def swarm_user_pw = ['','']
+def slave_nodename   = 'master'
+def slave_host_port  = "localhost:2375"
+def slave_tag_name   = 'default'
+def slave_dockerfile = 'Dockerfile'
+def has_myci = false
+try {
+node('master') {
+  ws
+  {
+    sh "mkdir -p ${pwd()}/ci"
+    dir("${pwd()}/ci") {
+      git branch: myci_branch, credentialsId: myci_cred, url: myci_repository
+      myci = load 'myci.groovy'
+      stash = load 'stash.groovy'
+      docker = load 'docker.groovy'
+      stash_user_pw = myci.credential(stash_userpw_cred).tokenize(':')
+      swarm_user_pw = myci.credential(swarm_userpw_cred).tokenize(':')
+    }
+    clean_ws()
+  }
+  if(sha != '0000000000000000000000000000000000000000') {
+  ws
+  {
+    stash.notify("INPROGRESS", stash_user_pw[0], stash_user_pw[1])
+    def STASH_HOST = STASH_URL.replaceFirst(/^http[s]*:\/\//, "")
+
+    conf = myci.prepare(".myci.yml", "ssh://git@${STASH_HOST}/${project_key}/${repository_slug}.git", sha, refspec)
+
+    def mapping          = getMapping()
+    def id               = "${env.BUILD_NUMBER}".toInteger().mod(mapping.size())
+    slave_host_port      = mapping[id]['host_port']
+    if(conf.containsKey('slave') && conf['slave'].containsKey('image') && conf['slave'].containsKey('description'))
+    {
+      slave_nodename       = "${mapping[id]['prefix']}-${conf['project']}-${env.BUILD_NUMBER}"
+    }
+    if(conf.containsKey('build_image') && conf['build_image'].containsKey('name') && conf['build_image'].containsKey('dockerfile'))
+    {
+      slave_tag_name   = conf['build_image']['name']
+      slave_dockerfile = conf['build_image']['dockerfile']
+      wrap([$class: 'AnsiColorBuildWrapper', colorMapName: "xterm"]) {
+        docker.build(slave_host_port, slave_tag_name, slave_dockerfile)
+      }
+    }
+    clean_ws()
+  }
+  }
+  clean_ws()
+}
+if(sha != '0000000000000000000000000000000000000000') {
+try {
+  node('master')
+  {
+    if(conf.containsKey('slave') && conf['slave'].containsKey('image') && conf['slave'].containsKey('description')) {
+    docker.start(slave_nodename
+                 ,slave_host_port
+                 ,JENKINS_MASTER_URL
+                 ,swarm_user_pw[0]
+                 ,swarm_user_pw[1]
+                 ,conf['slave']['description']
+                 ,'2'
+                 ,conf['slave']['image']
+    )
+    }
+  }
+  node(slave_nodename)
+  {
+    ws
+    {
+      clean_ws()
+      withEnv(['DOCKER_OPTS="-H=\"' + slave_host_port + '\""']) {
+        echo slave_host_port
+        wrap([$class: 'AnsiColorBuildWrapper', colorMapName: "xterm"]) {
+          myci.build(conf, refspec)
+        }
+      }
+    }
+  }
+} finally {
+  node('master')
+  {
+    if(conf.containsKey('slave') && conf['slave'].containsKey('image') && conf['slave'].containsKey('description')) {
+    docker.stop(slave_nodename,
+                slave_host_port)
+    }
+  }
+}
+}
+node('master')
+{
+  stash.notify("SUCCESSFUL", stash_user_pw[0], stash_user_pw[1])
+}
+} catch (e) {
+  try {
+    node('master')
+    {
+      stash.notify("FAILED", stash_user_pw[0], stash_user_pw[1])
+    }
+  } catch (err) {
+    throw err
+  }
+  throw e
+}
+
+def getMapping() {
+   [ [ 'prefix': 'j1', host_port: 'localhost:2375' ],
+     [ 'prefix': 'j2', host_port: 'localhost:2375' ] ]
+}
+
+def clean_ws() {
+    def cmd = '''#!/bin/bash
+for i in *;
+do
+  [ -e "$i" ] || continue ;
+  rm -rf "$i";
+done
+'''
+    sh "${cmd}"
+}
